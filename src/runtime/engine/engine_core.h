@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
+#include "runtime/constraint/json_mask_cache.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
@@ -1128,6 +1129,10 @@ private:
                 };
                 finish_reasons[row] = decision.finish_reason;
                 continuations[row]  = decision.continuation;
+                if (request->json_constraint && decision.accepted_tokens != 0) {
+                    advance_constraint(*request, lanes[row],
+                                       row_tokens.first(decision.accepted_tokens));
+                }
             }
             generated_staged = true;
             for (std::size_t row = 0; row < row_count; ++row) {
@@ -1529,6 +1534,24 @@ private:
                     request->sequence.emplace(sequence);
                     request->budget.emplace(std::move(control.budget));
                     request->lane.emplace(control.destination);
+                    // With thinking disabled there is no block to wait for, so the response
+                    // starts immediately.
+                    request->reasoning_closed = !request->output.in_reasoning();
+                    switch (request->options.execution.structured) {
+                    case StructuredFormat::JsonObject:
+                        // json_object means an OBJECT, not any JSON value.
+                        request->json_constraint.emplace(
+                            constraint::JsonConstraint::RootKind::Object);
+                        publish_allow_masks(*request, control.destination);
+                        break;
+                    case StructuredFormat::JsonSchema:
+                        // The schema was compiled at the wire, so a schema this engine cannot
+                        // enforce was already refused before the request got a lane.
+                        request->json_constraint.emplace(request->options.execution.schema);
+                        publish_allow_masks(*request, control.destination);
+                        break;
+                    case StructuredFormat::None: break;
+                    }
                     request->remaining_service_work      = control.summary.service_work_quanta;
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
@@ -1807,6 +1830,14 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
+        // The drafts this round will verify were fixed at the previous commit, so each column's
+        // constraint state is knowable now and every column gets its own mask.
+        for (const std::uint32_t lane : membership.lane_span()) {
+            const auto& request = slots_[lane];
+            if (request != nullptr && request->json_constraint) {
+                publish_allow_masks(*request, LaneId{lane});
+            }
+        }
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
@@ -2037,6 +2068,143 @@ private:
         }
     }
 
+    // Token bytes for the constraint, in the shape the mask builder wants.
+    [[nodiscard]] auto constraint_vocabulary() const {
+        return instance_.frontend.constraint_vocabulary();
+    }
+
+    // Publishes one allow-mask PER SPECULATIVE POSITION for a lane.
+    //
+    // A speculative round samples draft_window+1 columns from a single SamplingConfig, and each
+    // column sits at a different point in the document. Column 0 is the request's current state.
+    // Column c is reached only when drafts[0..c-1] were all accepted, so its state is the current
+    // state advanced through exactly those drafts -- and those drafts were fixed at the previous
+    // commit, so every column's mask is computable here, before the round runs.
+    //
+    // Building stops at the first draft the constraint rejects. Columns past it are unreachable,
+    // because that draft cannot be accepted under its own column's mask, so the round truncates
+    // there and the correction token is sampled under a mask that is exact for its position.
+    //
+    // Cheap despite the loop: the cache is keyed on constraint state and is process-wide, so
+    // these are hash lookups after the first request of a process.
+    void publish_allow_masks(Request& request, LaneId lane) {
+        if (!request.json_constraint) { return; }
+        const bool thinking = !request.reasoning_closed;
+        const auto vocabulary          = constraint_vocabulary();
+        const std::size_t words        = instance_.program->allow_mask_words();
+        const std::size_t positions    = instance_.program->allow_mask_positions();
+        const std::size_t token_domain = words * 32U;
+        const auto token_bytes         = [&](int id) -> std::string_view {
+            return id >= 0 && static_cast<std::size_t>(id) < vocabulary.token_bytes.size()
+                               ? vocabulary.token_bytes[static_cast<std::size_t>(id)]
+                               : std::string_view{};
+        };
+        const auto is_terminal = [&](int id) {
+            return std::find(vocabulary.terminal_tokens.begin(), vocabulary.terminal_tokens.end(),
+                             static_cast<TokenId>(id)) != vocabulary.terminal_tokens.end();
+        };
+
+        const std::span<const TokenId> drafts = instance_.program->pending_drafts(lane);
+        mask_scratch_.clear();
+        constraint::JsonConstraint state = *request.json_constraint;
+
+        // While the thinking block is open the response constraint must not apply -- it is not the
+        // response, and constraining it makes the model think in JSON and return empty content.
+        //
+        // But the boundary can fall INSIDE a draft block. If the drafter proposes the closing
+        // marker at column k and the target accepts it, columns k+1.. are already response tokens,
+        // generated in the same round, before any later round could install a mask. That leaked as
+        // content beginning "I don" and only then turning into JSON.
+        //
+        // The drafts are known here, so the boundary is too: columns up to and including the close
+        // stay unconstrained, and every column after it takes the constraint's opening mask. The
+        // other path needs no handling -- if the close is NOT drafted but the target emits it
+        // anyway, that is a draft rejection, and the round ends at the correction token with no
+        // response tokens behind it.
+        bool unconstrained = thinking;
+        for (std::size_t position = 0; position < positions; ++position) {
+            if (unconstrained) {
+                mask_scratch_.insert(mask_scratch_.end(), constraint::json_mask_words(token_domain),
+                                     0xFFFFFFFFU);
+            } else {
+                const std::vector<std::uint32_t>& mask =
+                    mask_cache_.mask_for(state, token_domain, token_bytes, is_terminal);
+                mask_scratch_.insert(mask_scratch_.end(), mask.begin(), mask.end());
+            }
+            if (position >= drafts.size()) { break; }
+            const std::string_view bytes = token_bytes(drafts[position]);
+            (void) bytes;
+            if (unconstrained) {
+                // A drafted token that ends the thinking block makes the column behind it the
+                // first response token.
+                if (std::find(vocabulary.reasoning_close_tokens.begin(),
+                              vocabulary.reasoning_close_tokens.end(),
+                              drafts[position]) != vocabulary.reasoning_close_tokens.end()) {
+                    unconstrained = false;
+                }
+                continue;
+            }
+            // An empty view is a special or terminal draft: accepting it ends the sequence, so
+            // the column behind it is unreachable and needs no mask.
+            if (bytes.empty() || !state.accept_all(bytes)) { break; }
+        }
+        instance_.program->upload_allow_masks(lane, mask_scratch_);
+    }
+
+    // Advances a request's constraint over the tokens just committed to it.
+    //
+    // Every committed token was sampled under a mask built for its own column, so a rejection here
+    // means the mask machinery is not doing its job rather than that the model misbehaved. The
+    // counter exists to say so out loud instead of silently emitting text the constraint no longer
+    // describes; the request stops being constrained rather than continuing under a stale state.
+    void advance_constraint(Request& request, LaneId lane, std::span<const TokenId> committed) {
+        if (!request.json_constraint) { return; }
+        const auto vocabulary = constraint_vocabulary();
+        if (!request.reasoning_closed) {
+            // Thinking tokens are not part of the document, so they must not advance it, and the
+            // mask was withheld over the same span so nothing here was constrained either.
+            const auto is_close = [&](TokenId id) {
+                return std::find(vocabulary.reasoning_close_tokens.begin(),
+                                 vocabulary.reasoning_close_tokens.end(),
+                                 id) != vocabulary.reasoning_close_tokens.end();
+            };
+            std::size_t after_close = committed.size();
+            for (std::size_t i = 0; i < committed.size(); ++i) {
+                if (is_close(committed[i])) {
+                    request.reasoning_closed = true;
+                    after_close              = i + 1;
+                    break;
+                }
+            }
+            if (!request.reasoning_closed) { return; }
+            // Anything committed AFTER the close in this same block is already a response token,
+            // produced before any later round could install a mask -- a speculative block can
+            // carry the boundary and several tokens past it. Rather than start the document at the
+            // next round and leave those bytes stranded in front of it, which is how content came
+            // back as "{{", fold them in so the constraint continues from where the response
+            // actually is. If they are not a valid opening the violation path below catches it,
+            // which is the honest outcome: they were genuinely unconstrained.
+            committed = committed.subspan(after_close);
+        }
+        for (const TokenId token : committed) {
+            if (token < 0 || static_cast<std::size_t>(token) >= vocabulary.token_bytes.size()) {
+                continue;
+            }
+            const std::string_view bytes = vocabulary.token_bytes[static_cast<std::size_t>(token)];
+            // Empty means special or terminal: no structural effect on the document.
+            if (bytes.empty()) { continue; }
+            if (!request.json_constraint->accept_all(bytes)) {
+                constraint_violations_.fetch_add(1, std::memory_order_relaxed);
+                request.json_constraint.reset();
+                instance_.program->upload_allow_masks(lane, {});
+                return;
+            }
+        }
+    }
+
+    std::vector<std::uint32_t> mask_scratch_;
+    constraint::JsonMaskCache mask_cache_;
+    std::atomic<std::uint64_t> constraint_violations_{0};
     Instance& instance_;
     DeviceContext& device_;
     const std::uint32_t max_context_;

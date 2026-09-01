@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include <memory>
 #include <atomic>
 #include <cstdint>
 #include <optional>
@@ -11,6 +12,8 @@ namespace ninfer::runtime {
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
+    StructuredFormat structured = StructuredFormat::None;
+    std::shared_ptr<const constraint::CompiledSchema> schema;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;

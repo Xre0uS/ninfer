@@ -245,8 +245,30 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+namespace constraint {
+class CompiledSchema;
+} // namespace constraint
+
+// Token-level output constraint.
+//
+// JsonObject is the structural half of OpenAI's response_format: the document must parse as an
+// object, with no schema attached. JsonSchema adds property, type, required, enum and item-count
+// enforcement on the same token mask, driven by a CompiledSchema.
+//
+// A schema this engine cannot enforce is refused at the wire rather than accepted and ignored, so
+// there is no mode here that returns 200 for output that does not conform.
+enum class StructuredFormat : std::uint8_t {
+    None,
+    JsonObject,
+    JsonSchema,
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
+    StructuredFormat structured = StructuredFormat::None;
+    // Set exactly when structured is JsonSchema. Shared because one compiled schema serves every
+    // request that sent it, and the engine holds it for the request's lifetime.
+    std::shared_ptr<const constraint::CompiledSchema> schema;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;

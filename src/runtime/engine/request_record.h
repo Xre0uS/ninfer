@@ -2,6 +2,7 @@
 
 #include "core/nvtx.h"
 #include "ninfer/types.h"
+#include "runtime/constraint/json_constraint.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/admission_policy.h"
@@ -174,6 +175,14 @@ struct RequestRecord {
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;
+    // Live token-level constraint, present only while options.execution.structured is not None.
+    // Advanced over every committed token, and the source of the lane's device allow-mask.
+    std::optional<constraint::JsonConstraint> json_constraint;
+    // Whether the thinking block has ended, tracked from COMMITTED token ids rather than from the
+    // decoder's in_reasoning flag. The decoder buffers text to handle a marker split across
+    // tokens, so its flag flips one token late -- late enough for the first response token to be
+    // generated unconstrained, which showed up as content beginning "{{".
+    bool reasoning_closed = false;
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
