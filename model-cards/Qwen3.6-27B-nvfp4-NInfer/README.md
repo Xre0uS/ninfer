@@ -170,7 +170,8 @@ The artifact supports:
 - text generation in thinking and non-thinking modes;
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
-- row-scaled FP8 E4M3, INT8 group-64, and BF16 KV cache;
+- NVFP4 group-16, asymmetric FP8-K/NVFP4-V K8V4, row-scaled FP8 E4M3, INT8 group-64,
+  and BF16 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;

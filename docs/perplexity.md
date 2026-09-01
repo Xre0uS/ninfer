@@ -19,7 +19,8 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are `bf16`, `int8`, and `fp8`.
+KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`. Reports retain the exact
+selected external name in `execution.kv_dtype`.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
@@ -32,6 +33,9 @@ Run `./build/apps/ninfer-perplexity --help` for the complete command surface. Th
 the model once, verifies and tokenizes every selected stream before scoring, prints throttled
 progress to stderr, prints the final domain/overall table to stdout, and writes `report.json` under
 `profiles/perplexity/` unless `--output` supplies an empty directory.
+
+The fixed 64K comparison protocol uses the same registered artifact and full corpus for every
+mode with `--context 65536 --stride 32768`; `--quick` is not part of that acceptance run.
 
 ## Metric
 

@@ -18,7 +18,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
-    if (cache.dtype == DType::FP8_E4M3FN) {
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
         if (tokens >= 128 && Geometry::KVHeads == 2) {
@@ -51,7 +51,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    if (cache.dtype == DType::I8) {
+    if (cache.storage == KvCacheStorage::Int8Group64) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
         if (tokens >= 128 && Geometry::KVHeads == 2) {
@@ -163,6 +163,16 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (cache.storage == KvCacheStorage::K8V4) {
+        kv_cache_append_k8v4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                          stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        kv_cache_append_nvfp4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                           stream);
+        return;
+    }
     const auto launch = [&]<bool Masked>() {
         const KVCacheAppendBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),

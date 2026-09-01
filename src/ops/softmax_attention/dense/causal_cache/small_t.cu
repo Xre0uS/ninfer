@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "ops/common/math.h"
+#include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
@@ -42,25 +43,26 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
 }
 
 template <typename Geometry>
-std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
+std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens,
+                                        KvCacheStorage storage) {
     if constexpr (Geometry::SmallTSplitScale == 1) {
-        if (kv_dtype == DType::FP8_E4M3FN && tokens == 1 && window > 8198) {
+        if (storage == KvCacheStorage::Fp8E4M3Row256 && tokens == 1 && window > 8198) {
             return Geometry::SmallTMaximumSplits;
         }
     }
     // A 64-key default split just above a 32-key boundary makes the partial kernel execute a
     // nearly empty second tile. T=5 uses one 32-key tile per split; the short T=6 profile keeps
     // all newly appended rows in one tail split while retaining a useful B=8 grid.
-    if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
+    if (storage == KvCacheStorage::Int8Group64 && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::SmallTSplitScale);
     }
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
+    if (storage == KvCacheStorage::Int8Group64 && tokens == 6 && window > 128 && window <= 160) {
         constexpr std::int32_t kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
         return div_up(window, kKeysPerSplit);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (storage == KvCacheStorage::Int8Group64 && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::SmallTSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::SmallTSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::SmallTSplitScale;
@@ -72,13 +74,13 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
 
 template <typename Geometry>
 std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope envelope,
-                                            std::int32_t tokens, DType dtype) {
+                                            std::int32_t tokens, KvCacheStorage storage) {
     std::int32_t capacity = 0;
     const auto include    = [&](std::uint32_t window) {
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
-        const auto splits =
-            causal_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, dtype);
-        capacity = capacity > splits ? capacity : splits;
+        const auto splits = causal_small_t_split_count<Geometry>(static_cast<std::int32_t>(window),
+                                                                    tokens, storage);
+        capacity          = capacity > splits ? capacity : splits;
     };
     include(envelope.min_visible_keys);
     include(envelope.max_visible_keys);
@@ -218,8 +220,7 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
-        .dtype         = cache.dtype,
-        .quant_group   = cache.quant_group,
+        .storage       = cache.storage,
     };
 }
 
@@ -228,19 +229,18 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 bool causal_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                             DType cache_dtype,
+                                             KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 ||
-        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
-         cache_dtype != DType::FP8_E4M3FN) ||
-        envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
+    if (tokens < 1 || tokens > 6 || envelope.min_visible_keys == 0 ||
+        envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
+    (void)d256_kv_cache_profile(cache_storage);
     if (q_heads == CausalD256H24Kv4::QHeads) {
-        return causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_dtype);
+        return causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
     }
     if (q_heads == CausalD256H16Kv2::QHeads) {
-        return causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_dtype);
+        return causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_storage);
     }
     throw std::invalid_argument(
         "causal_softmax_attention split capacity: unsupported head geometry");
@@ -256,14 +256,14 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
-        causal_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+        causal_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.storage);
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
 #define NINFER_CAUSAL_SMALL_T_DISPATCH(TOKENS, WARPS)                                              \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (cache.dtype == DType::I8) {                                                        \
+            if (cache.storage == KvCacheStorage::Int8Group64) {                                    \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
@@ -350,7 +350,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
             launch_profile.template operator()<Int8, true, false>();
         }
     };
-    if (cache.dtype == DType::I8) {
+    if (cache.storage == KvCacheStorage::Int8Group64) {
         launch_for_dtype.template operator()<true>();
     } else {
         launch_for_dtype.template operator()<false>();
@@ -363,10 +363,22 @@ void causal_attention_small_t_launch(
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
-    if (cache.dtype == DType::FP8_E4M3FN) {
+    if (cache.storage == KvCacheStorage::K8V4) {
+        causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
+                                             envelope, column_begin, width, partial_acc, partial_m,
+                                             partial_l, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_small_t_fp8_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                             envelope, column_begin, width, partial_acc, partial_m,
                                             partial_l, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        causal_attention_small_t_nvfp4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
+                                              envelope, column_begin, width, partial_acc, partial_m,
+                                              partial_l, out, stream);
         return;
     }
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
@@ -395,9 +407,19 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                             CausalAttentionExecutionEnvelope envelope,
                                             Tensor& partial_acc, Tensor& partial_m,
                                             Tensor& partial_l, Tensor& out, cudaStream_t stream) {
-    if (cache.dtype == DType::FP8_E4M3FN) {
+    if (cache.storage == KvCacheStorage::K8V4) {
+        causal_attention_cached_small_t_k8v4_launch(q, pos, scale, cache, envelope, partial_acc,
+                                                    partial_m, partial_l, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_cached_small_t_fp8_launch(q, pos, scale, cache, envelope, partial_acc,
                                                    partial_m, partial_l, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        causal_attention_cached_small_t_nvfp4_launch(q, pos, scale, cache, envelope, partial_acc,
+                                                     partial_m, partial_l, out, stream);
         return;
     }
     const CausalCachedInput input{};

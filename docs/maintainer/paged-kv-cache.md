@@ -78,8 +78,9 @@ MTP 与 DFlash 在一个 Engine 内互斥，因此当前最多有两个 growing 
 | MTP | MTP persistent K/V 与其 code/scale planes | MTP KV frontier |
 | DFlash Full | DFlash persistent full-context K/V | DFlash context frontier |
 
-Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64 或 FP8-E4M3FN-row256 KV profile；DFlash Full
-使用自己的 BF16 layout。
+Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
+KV profile；DFlash Full 使用自己的 BF16 layout。K8V4 是封闭的非对称 profile，不是运行时 bit-width
+组合：K 固定为 FP8-row256，V 固定为 NVFP4-G16。
 
 Common pool implementation 只接收 `KVPageGeometry`、plane inventory 和 capacity。Target/runtime 负责把
 plane ordinal 解释成 layer、K/V、code 或 scale。
@@ -238,6 +239,7 @@ DFlash Full 使用 head-major page run：
 - \(X=D\) 表示 K/V 或 quantized code plane；
 - INT8-G64 scale plane 使用 \(X=D/64\)；
 - FP8-E4M3FN-row256 scale plane 使用 \(X=1\)；
+- NVFP4-G16 code plane 使用 packed U8 \(X=D/2\)，scale plane 使用 U8 \(X=D/16\)；
 - \(H\) 是 KV heads；
 - \(N_{physical}\) 是该 pool 的 physical page count。
 
@@ -262,6 +264,20 @@ address=base+d\,nb_0+o\,nb_1+g\,nb_2+h\,nb_3
 Code 与 scale planes 使用同一个 \(g\)，但使用各自 Tensor 的 leading coordinate 和 strides。
 Exact persistent codec 由对应 target model 与 consuming Op 定义；allocator 只解释 plane bytes、order
 和 page-group identity。
+
+D256 Main/MTP profile 的单 token/head 物理 payload 为：
+
+| profile | K code + scale | V code + scale | K+V |
+|---|---:|---:|---:|
+| BF16 | 512 B | 512 B | 1024 B |
+| INT8-G64 | 256 B + 8 B | 256 B + 8 B | 528 B |
+| FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
+| NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
+| K8V4 | 256 B + 2 B | 128 B + 16 B | 402 B |
+
+K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
+identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory
+summary 均从这一 typed plane inventory 计算，不能用 `2 * vector_bytes` 代替 K8V4 的非对称字节数。
 
 ### 4.4 Logical position domain
 

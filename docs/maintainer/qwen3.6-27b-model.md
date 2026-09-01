@@ -146,8 +146,8 @@ x = x + o_projection(a)
 ```
 
 Prefill appends all K/V columns and evaluates causal attention for the chunk. Decode appends one
-column and attends over the resident prefix. KV storage may be BF16, INT8-G64, or
-FP8-E4M3FN-row256. The exact runtime
+column and attends over the resident prefix. KV storage may be BF16, INT8-G64,
+FP8-E4M3FN-row256, NVFP4-G16, or K8V4. The exact runtime
 cache codec is defined by the repository-internal
 [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) contract; append-and-attend and
 cached-only computation use
@@ -382,16 +382,23 @@ remain consistent.
 - ordinary and Q/K norm oracles evaluate their reductions in FP32/FP64 and compare the declared
   BF16 outputs; production reduction and staging are route-private choices;
 - GDN `g`, `beta`, and recurrent state are FP32;
-- the ideal GQA oracle evaluates dot products, stable softmax, and value reduction in FP64 from
-  BF16 Q and logical cache values; the BF16 Op output is promoted to FP64 for comparison;
+- the unquantized GQA oracle evaluates dot products, stable softmax, and value reduction in FP64
+  from BF16 Q/K/V; it is the semantic reference used to report cache-quantization quality;
 - low-bit weight storage changes representation, not the intended dequantized matrix;
 - INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
   decode;
 - FP8-E4M3FN-row256 KV stores one FP16 scale per complete D256 row; its ideal logical K/V values
   are the persistent codec's FP32 decode, including the fixed inverse K rotation;
-- the target's INT8 and FP8 attention paths intentionally quantize Q for production computation;
-  those native compute profiles do not replace BF16 Q in the common ideal oracle, and their deltas
-  are accepted through separate named cache-profile criteria;
+- NVFP4-G16 stores 256 packed E2M1 codes and sixteen UE4M3 scales for each rotated K or V vector;
+  K8V4 uses the existing row-scaled FP8 representation for rotated K and NVFP4-G16 for rotated V;
+- NVFP4 and K8V4 rotate Q/K/V with the normalized D256 Hadamard in FP32, use FP32 QK
+  accumulation, keep P in FP32 except for its single FP16 PV-MMA operand cast, accumulate PV in
+  FP32, and apply the FP32 inverse Hadamard before the final BF16 output;
+- the NVFP4/K8V4 represented-value Op oracle independently performs FP32 forward Hadamard, exact
+  Q/K/V codec encode/decode, FP64 QK/softmax/PV, and FP64 inverse Hadamard from the public BF16
+  inputs; production is checked directly against this complete formula, while its delta from the
+  unquantized oracle is reported separately;
+- the INT8 and FP8 production paths retain their existing named compute-profile criteria;
 - the full target `lm_head` is used for prefill, verification, and ordinary decode regardless of
   draft-head mode.
 
@@ -402,10 +409,10 @@ route and accepted against the Op's criterion for that implementation profile.
 
 GQA numerical qualification covers both registered geometries, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
-BF16-cache, INT8-cache, and FP8-cache compute-profile criteria are explicitly named in the GQA
-conformance suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16
-tensor. A1 append-and-attend and A3 cached-only attention are each checked directly against the
-common ideal oracle. Equality between those different numerical paths is not a contract or
+BF16-cache, INT8-cache, FP8-cache, NVFP4-cache, and K8V4-cache criteria are explicitly named in the
+GQA conformance suite; they are not claimed as pointwise bounds for every arbitrary or adversarial
+BF16 tensor. A1 append-and-attend and A3 cached-only attention are checked against the applicable
+independent oracle above. Equality between different production paths is not a contract or
 acceptance test.
 
 ## 13. State inventory

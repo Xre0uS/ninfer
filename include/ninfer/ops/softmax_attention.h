@@ -42,17 +42,24 @@ struct ContextAttentionExecutionEnvelope {
  *
  * A causal INT8-G64 V row is interpreted by decoding each signed code c with its stored FP16 scale
  * bits: FP32(c) * FP32(scale_bits). A causal FP8-E4M3FN V row has one stored FP16 scale for D256;
- * each finite code e is decoded as FP32(e) * FP32(scale_bits). Quantized K uses the paired physical
- * representation written by kv_cache_append; its original-coordinate logical row is consumed
- * through the matching private Q/K profile. The fixed orthogonal preparation and transient Q
- * quantization are implementation details, not intermediate values in the ideal oracle above.
+ * each finite code e is decoded as FP32(e) * FP32(scale_bits). NVFP4-G16 K/V use sixteen packed
+ * E2M1 groups, each with one stored UE4M3 scale; K8V4 combines row-scaled FP8 K with NVFP4-G16 V.
+ * Quantized K uses the paired physical representation written by kv_cache_append; its
+ * original-coordinate logical row is consumed through the matching Q/K profile. NVFP4 and K8V4
+ * additionally store R*V for the normalized Hadamard R=H256/16, and apply R^T after the complete
+ * attention reduction. Their represented-value conformance oracle independently evaluates RQ,
+ * RK, and RV in FP32; performs the exact Q/K/V codec encode/decode; evaluates QK, stable Softmax,
+ * PV, and R^T in FP64; and compares the final BF16 production output. Its delta from the
+ * unquantized BF16/FP64 oracle above is separate quantization-quality evidence.
  *
- * The qualified FP8 compute profile uses native E4M3FN QK MMA with FP32 accumulation, FP32
- * Softmax, exact E4M3FN-to-FP16 V-code conversion followed by one represented FP16 scale multiply,
- * FP16 P/V MMA with FP32 accumulation, FP32 split merge/normalization, and a final BF16 output
- * store. This arithmetic path is an implementation profile rather than an extra public semantic
- * boundary. BF16, INT8-G64, and FP8-E4M3FN routes have separate numerical criteria and are each
- * checked directly against the ideal oracle; route-to-route parity is only supplementary evidence.
+ * The qualified FP8 and K8V4 compute profiles use native E4M3FN QK MMA with FP32 accumulation;
+ * NVFP4 uses native block-scaled E2M1 QK MMA with UE4M3 scales and FP32 accumulation. All three
+ * keep Softmax, split state, merge, normalization, and Hadamard reductions in FP32. P is never
+ * quantized to FP8/FP4: it is cast once to FP16 at the PV MMA boundary. V is represented exactly
+ * as an FP16 operand, PV uses FP16 Tensor Cores with FP32 accumulation, and only the final public
+ * output is stored as BF16. These arithmetic paths are implementation profiles rather than extra
+ * public tensor boundaries. Every cache route has one named numerical criterion and is checked
+ * directly against its independent oracle; route-to-route parity is only supplementary evidence.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and
  * target-representative activation range; they are not universal error bounds for arbitrary
  * adversarial BF16 tensors.
@@ -108,8 +115,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16, INT8-G64, or row-scaled FP8-E4M3FN. valid_columns is either
- * contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
+ * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
+ * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
  * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
  * W=1..16.
@@ -155,8 +162,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
  * Invalid profiles or intervals throw; a legal prompt route may return zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
-    AttentionHeadGeometry geometry, DType cache_dtype, CausalAttentionExecutionEnvelope envelope,
-    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens);
+    AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
+    CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
+    std::int32_t max_tokens);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.

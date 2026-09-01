@@ -30,6 +30,8 @@ enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
     Fp8E4M3Row256,
+    Nvfp4Group16,
+    K8V4,
 };
 
 enum class EnginePurpose : std::uint8_t {

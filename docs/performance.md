@@ -37,6 +37,173 @@ over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture 
 seeds. Values are arithmetic mean ± sample standard deviation, and server warm-up completes before
 the measured requests. The concurrent campaign has its own sustained-wave method below.
 
+## NVFP4 and K8V4 KV-cache operator qualification
+
+The D256 paged causal-attention routes were qualified on an NVIDIA GeForce RTX 5090 with CUDA
+13.1, `sm_120a`, cold L2 conditioning, fragmented physical-page mappings, and one captured public
+Op per timed interval. Latencies below are medians in microseconds; setup, graph capture, and
+synchronization are outside the interval. All modes at a table point use the same B, W, visible
+context, mapping, append/cached state, and timing method.
+
+Persistent K+V storage is 1,024 bytes per token/head for BF16, 516 for FP8, 288 for NVFP4, and 402
+for K8V4. The asymmetric K8V4 value comprises a 258-byte FP8 key and a 144-byte NVFP4 value.
+
+| Public Op and geometry | B | W | Visible context | BF16 | FP8 | NVFP4 | K8V4 | NVFP4 vs FP8 | K8V4 vs FP8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| append, H24/KV4 | 1 | 1 | 128 | 17.696 | 11.520 | 11.488 | 11.552 | 1.00× | 1.00× |
+| append, H24/KV4 | 1 | 1 | 2,048 | 21.792 | 15.392 | 13.376 | 13.568 | 1.15× | 1.13× |
+| append, H24/KV4 | 1 | 1 | 65,536 | 187.616 | 99.584 | 62.656 | 83.200 | 1.59× | 1.20× |
+| cached, H16/KV2 | 1 | 6 | 65,536 | 140.576 | 81.120 | 64.768 | 74.912 | 1.25× | 1.08× |
+| append, H24/KV4 | 8 | 1 | 8,192 per row | 211.904 | 120.000 | 78.848 | 97.568 | 1.52× | 1.23× |
+| append, H16/KV2 | 8 | 6 | 8,192 per row | 240.928 | 201.888 | 169.184 | 171.264 | 1.19× | 1.18× |
+
+The complete B=8 small-T matrix covers both registered GQA geometries, W=1/6, and context
+128/2,048/8,192. Across those points NVFP4 is 0.997–1.52× faster than FP8 (median 1.19×), and
+K8V4 is 0.996–1.43× faster (median 1.17×). The near-parity short-context end is the fixed online
+Hadamard/quantization and final inverse-Hadamard cost; reduced persistent traffic dominates from
+2K onward.
+
+Prompt results use the same complete public append-and-attend contract:
+
+| Geometry | W | Existing context | BF16 | FP8 | NVFP4 | K8V4 |
+|---|---:|---:|---:|---:|---:|---:|
+| H24/KV4 | 64 | 2,048 | 122.080 | 113.920 | 107.776 | 118.016 |
+| H24/KV4 | 64 | 8,192 | 451.840 | 410.880 | 365.824 | 417.056 |
+| H24/KV4 | 64 | 65,536 | 3,545.380 | 3,178.020 | 2,785.060 | 3,209.340 |
+
+The complete T=1,024 prefill sweep uses the same fragmented cold-graph contract and reports median
+complete-Op latency in microseconds. Existing context excludes the new 1,024-token chunk:
+
+| Geometry | Existing context | BF16 | FP8 | NVFP4 | K8V4 |
+|---|---:|---:|---:|---:|---:|
+| H24/KV4 | 0 | 122.112 | 120.064 | 118.080 | 126.240 |
+| H24/KV4 | 16,384 | 2,762.560 | 2,492.640 | 2,193.180 | 2,519.840 |
+| H24/KV4 | 32,768 | 5,411.490 | 4,869.410 | 4,264.740 | 4,916.260 |
+| H24/KV4 | 65,536 | 10,704.700 | 9,634.270 | 8,408.350 | 9,708.830 |
+| H16/KV2 | 0 | 95.232 | 93.472 | 95.488 | 99.616 |
+| H16/KV2 | 16,384 | 1,875.200 | 1,647.490 | 1,469.730 | 1,688.640 |
+| H16/KV2 | 32,768 | 3,647.780 | 3,201.310 | 2,842.910 | 3,279.100 |
+| H16/KV2 | 65,536 | 7,204.670 | 6,310.140 | 5,591.870 | 6,481.700 |
+
+QK/PV full-public-Op-equivalent throughput is reported separately because it is not isolated MMA
+throughput. QK and PV have equal logical FLOP counts at these points, so each cell is
+`QK TFLOP/s / PV TFLOP/s`:
+
+| Geometry | Existing context | BF16 | FP8 | NVFP4 | K8V4 |
+|---|---:|---:|---:|---:|---:|
+| H24/KV4 | 0 | 52.81 / 52.81 | 53.71 / 53.71 | 54.61 / 54.61 | 51.08 / 51.08 |
+| H24/KV4 | 16,384 | 76.96 / 76.96 | 85.29 / 85.29 | 96.94 / 96.94 | 84.37 / 84.37 |
+| H24/KV4 | 32,768 | 77.38 / 77.38 | 86.00 / 86.00 | 98.19 / 98.19 | 85.18 / 85.18 |
+| H24/KV4 | 65,536 | 77.64 / 77.64 | 86.26 / 86.26 | 98.84 / 98.84 | 85.60 / 85.60 |
+| H16/KV2 | 0 | 45.14 / 45.14 | 45.99 / 45.99 | 45.02 / 45.02 | 43.16 / 43.16 |
+| H16/KV2 | 16,384 | 75.59 / 75.59 | 86.03 / 86.03 | 96.44 / 96.44 | 83.94 / 83.94 |
+| H16/KV2 | 32,768 | 76.53 / 76.53 | 87.21 / 87.21 | 98.20 / 98.20 | 85.14 / 85.14 |
+| H16/KV2 | 65,536 | 76.90 / 76.90 | 87.80 / 87.80 | 99.08 / 99.08 | 85.48 / 85.48 |
+
+The dense RTX 5090 peak model is 209.5 TFLOP/s for BF16/FP16, 419.0 for FP8, and 838.0 for
+NVFP4. QK uses the cache profile's native peak; every PV route uses FP16. Therefore the mixed
+complete-Op Tensor Core peak utilization is
+`(QK FLOPs / QK peak + PV FLOPs / 209.5 TFLOP/s) / measured latency`:
+
+| Geometry | Existing context | BF16 | FP8 | NVFP4 | K8V4 |
+|---|---:|---:|---:|---:|---:|
+| H24/KV4 | 0 | 50.42% | 38.46% | 32.59% | 36.58% |
+| H24/KV4 | 16,384 | 73.47% | 61.07% | 57.84% | 60.41% |
+| H24/KV4 | 32,768 | 73.88% | 61.57% | 58.59% | 60.99% |
+| H24/KV4 | 65,536 | 74.12% | 61.76% | 58.97% | 61.29% |
+| H16/KV2 | 0 | 43.10% | 32.93% | 26.86% | 30.90% |
+| H16/KV2 | 16,384 | 72.16% | 61.60% | 57.54% | 60.10% |
+| H16/KV2 | 32,768 | 73.06% | 62.44% | 58.59% | 60.96% |
+| H16/KV2 | 65,536 | 73.42% | 62.87% | 59.12% | 61.20% |
+
+The second 16K–64K sweep changed no median by more than 42.178 microseconds. K8V4 remains above
+FP8 in absolute latency because its smaller V traffic does not yet repay group-16 V decode and the
+FP32 inverse rotation in this prompt regime. With no existing context, fixed
+Hadamard/quantization cost dominates.
+
+NVFP4 benefits from reducing both K and V.
+At H24/KV4, W=1, C=65,536, the complete-Op effective persistent-cache bandwidth is 1,205 GB/s for
+NVFP4 and 1,267 GB/s for K8V4, while aggregate QK+PV work rates are 25.71 and 19.36 TFLOP/s. The
+mixed Tensor Core roofline percentages are 7.67% and 6.93%; these explanatory values include the
+entire Op and are not contraction-only acceptance criteria.
+
+The dispatch-seam matrix additionally covers W=5/6/7/12/13/16/17 at context
+128/512/513/1,024/1,025/2,048 for both geometries, all storage modes, and both append and cached
+entries. The distinct maximum-context anchor uses W=1 and 262,144 visible tokens:
+
+| Public Op and geometry | BF16 | FP8 | NVFP4 | K8V4 |
+|---|---:|---:|---:|---:|
+| append, H24/KV4 | 676.608 | 350.976 | 209.792 | 283.872 |
+| cached, H24/KV4 | 676.864 | 349.472 | 208.160 | 283.616 |
+| append, H16/KV2 | 369.664 | 191.776 | 111.872 | 152.832 |
+| cached, H16/KV2 | 369.792 | 191.648 | 111.840 | 152.832 |
+
+Standalone append exposes the fixed quantization cost directly. At H24/KV4, T=1, 64, and 1,024,
+BF16/FP8/NVFP4/K8V4 take respectively 3.328/5.152/5.408/5.408,
+3.360/5.408/7.456/7.200, and 7.424/7.424/11.424/9.472 microseconds. This is the fused FP32 K/V
+Hadamard, scale reduction, encoding, and paged store cost; it does not introduce a second cache
+pass or a global K/V staging tensor.
+
+Profiling the initial H16/KV2 W=1 C=2,048 NVFP4 small-T route attributed 44.59 microseconds, about
+89% of the two-kernel time, to its output reducer. Computing each split weight once, merging D256
+in parallel, and applying the FP32 inverse Hadamard once reduced that reducer to 4.25 microseconds
+(10.5×) without changing the represented-value oracle. The independently dispatched K8V4 reducer
+uses the same one-weight-per-split merge structure.
+
+A targeted Nsight Compute 2025.4.1 capture of one H24/KV4 W=1 C=65,536 fragmented cold-graph
+small-T launch confirms the remaining kernels are memory-bound. NVFP4 takes 67.65 microseconds,
+reads 75.586 MB from DRAM at 1.17 TB/s, reaches 66.10% DRAM and 32.29% SM throughput, and achieves
+32.99% occupancy with 124 registers/thread. K8V4 takes 93.98 microseconds, reads 105.470 MB at
+1.21 TB/s, reaches 68.73% DRAM and 27.11% SM throughput, and achieves 33.19% occupancy with 116
+registers/thread. Tensor-pipe active time is 20.99% and 20.40% respectively. The declared
+persistent-cache reads are 75.499 MB and 105.383 MB respectively;
+the sub-0.12% excess is query, output, and metadata traffic, so the counters rule out an extra cache
+pass or per-GQA-head K/V reload. Neither kernel spills local or shared memory. NVFP4 is chiefly
+long-scoreboard limited (3.73 cycles/issued instruction); K8V4 is chiefly barrier limited (4.50),
+consistent with its larger FP8-K staging path.
+
+### Full 64K perplexity cross-check
+
+The four modes were rerun consecutively with the same registered
+`qwen3.6-27b/groupwise-int` artifact, its embedded tokenizer, device 0, and the complete
+`ninfer-ppl-1m-v1` corpus. Each run used context 65,536 and stride 32,768 and scored the same
+1,044,557 tokens in the same 16 streams.
+
+| Domain | BF16 NLL / PPL | FP8 NLL / PPL | NVFP4 NLL / PPL | K8V4 NLL / PPL |
+|---|---:|---:|---:|---:|
+| Chinese reference | 1.579893 / 4.854436 | 1.580128 / 4.855579 | 1.582875 / 4.868936 | 1.581407 / 4.861794 |
+| English long form | 1.943245 / 6.981367 | 1.943474 / 6.982966 | 1.945945 / 7.000243 | 1.944133 / 6.987571 |
+| English reference | 1.920895 / 6.827063 | 1.922540 / 6.838305 | 1.930157 / 6.890591 | 1.921348 / 6.830160 |
+| NInfer code | 0.474049 / 1.606486 | 0.474633 / 1.607424 | 0.476592 / 1.610576 | 0.474605 / 1.607380 |
+| Overall | 1.480949 / 4.397116 | 1.481622 / 4.400077 | 1.485322 / 4.416386 | 1.481803 / 4.400873 |
+
+Overall NVFP4 changes versus BF16 are +0.004373 mean NLL (+0.295%) and +0.019270 PPL
+(+0.438%); versus FP8 they are +0.003700 (+0.250%) and +0.016309 (+0.371%). Overall K8V4
+changes versus BF16 are +0.000854 mean NLL (+0.058%) and +0.003757 PPL (+0.085%); versus FP8
+they are +0.000181 (+0.012%) and +0.000796 (+0.018%). The largest domain shift is NVFP4 English
+reference PPL, +0.931% versus BF16; the independent represented-value operator oracle and the
+other domains show no rotation, append/cached, or state-transaction anomaly.
+
+NVFP4 absolute and relative changes are:
+
+| Domain | vs BF16 ΔNLL (relative) | vs BF16 ΔPPL (relative) | vs FP8 ΔNLL (relative) | vs FP8 ΔPPL (relative) |
+|---|---:|---:|---:|---:|
+| Chinese reference | +0.002983 (+0.189%) | +0.014500 (+0.299%) | +0.002747 (+0.174%) | +0.013358 (+0.275%) |
+| English long form | +0.002700 (+0.139%) | +0.018876 (+0.270%) | +0.002471 (+0.127%) | +0.017277 (+0.247%) |
+| English reference | +0.009262 (+0.482%) | +0.063528 (+0.931%) | +0.007617 (+0.396%) | +0.052286 (+0.765%) |
+| NInfer code | +0.002543 (+0.536%) | +0.004090 (+0.255%) | +0.001959 (+0.413%) | +0.003151 (+0.196%) |
+| Overall | +0.004373 (+0.295%) | +0.019270 (+0.438%) | +0.003700 (+0.250%) | +0.016309 (+0.371%) |
+
+K8V4 absolute and relative changes are:
+
+| Domain | vs BF16 ΔNLL (relative) | vs BF16 ΔPPL (relative) | vs FP8 ΔNLL (relative) | vs FP8 ΔPPL (relative) |
+|---|---:|---:|---:|---:|
+| Chinese reference | +0.001514 (+0.096%) | +0.007357 (+0.152%) | +0.001279 (+0.081%) | +0.006215 (+0.128%) |
+| English long form | +0.000888 (+0.046%) | +0.006204 (+0.089%) | +0.000659 (+0.034%) | +0.004605 (+0.066%) |
+| English reference | +0.000454 (+0.024%) | +0.003097 (+0.045%) | -0.001192 (-0.062%) | -0.008145 (-0.119%) |
+| NInfer code | +0.000556 (+0.117%) | +0.000894 (+0.056%) | -0.000028 (-0.006%) | -0.000045 (-0.003%) |
+| Overall | +0.000854 (+0.058%) | +0.003757 (+0.085%) | +0.000181 (+0.012%) | +0.000796 (+0.018%) |
+
 ## Single-request serving performance method
 
 | Setting | Value |

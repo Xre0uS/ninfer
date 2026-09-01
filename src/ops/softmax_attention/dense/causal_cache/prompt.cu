@@ -31,7 +31,7 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     CUDA_CHECK(attr_i8);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    if (cache.dtype == DType::I8) {
+    if (cache.storage == KvCacheStorage::Int8Group64) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
@@ -64,7 +64,15 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                               const PagedKVLayerView& cache, Tensor& out,
                                               cudaStream_t stream) {
-    if (cache.dtype == DType::FP8_E4M3FN) {
+    if (cache.storage == KvCacheStorage::K8V4) {
+        causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        causal_attention_prompt_nvfp4_attention_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, out, stream);
         return;
     }
@@ -83,7 +91,17 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
                                     PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream) {
-    if (cache.dtype == DType::FP8_E4M3FN) {
+    if (cache.storage == KvCacheStorage::K8V4) {
+        causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
+                                            cache, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        causal_attention_prompt_nvfp4_launch(q, k, v, positions, valid_columns, table_rows, scale,
+                                             cache, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_prompt_fp8_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                            cache, out, stream);
         return;
