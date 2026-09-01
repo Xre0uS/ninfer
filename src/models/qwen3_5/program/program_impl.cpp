@@ -243,6 +243,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
+    if (plan.persistent.allow_mask) {
+        allow_mask = plan.persistent.allow_mask->bind(backing);
+    }
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
@@ -298,6 +301,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
         CUDA_CHECK(
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(allow_mask.data, 0, allow_mask.bytes(), device.stream));
     }
     device.synchronize();
     if (use_cuda_graph) {

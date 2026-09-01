@@ -12,6 +12,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    // The verify card is built fresh each round and never went through configure_text_card, so
+    // without this its sampling config is null and a constraint cannot reach the target argmax.
+    card.set_sampling(frame.sampling);
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,

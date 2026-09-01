@@ -900,6 +900,13 @@ public:
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);
+    // Publish a constrained-decoding allow-mask for one lane: a bitset over the token domain, set
+    // where a token is legal at that sequence's current position. An empty span clears it.
+    // allow_mask_words() is the exact width a mask must have.
+    void upload_allow_masks(runtime::LaneId lane, std::span<const std::uint32_t> masks);
+    [[nodiscard]] std::size_t allow_mask_words() const noexcept;
+    [[nodiscard]] std::size_t allow_mask_positions() const noexcept;
+    [[nodiscard]] std::span<const TokenId> pending_drafts(runtime::LaneId lane) const;
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
                            const SharedPrefixHandle* replacement,

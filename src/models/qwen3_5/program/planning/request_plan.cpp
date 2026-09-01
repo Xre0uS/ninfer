@@ -2,6 +2,10 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 #include "models/qwen3_5/program/context.h"
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -26,6 +30,49 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
     }
 }
 
+// PROTOTYPE SCAFFOLD -- constrained-decoding step 2. See infra/ninfer/STRUCTURED-OUTPUT.md.
+//
+// Installs a fixed allow-mask from NINFER_DEBUG_ALLOW_TOKENS (a comma-separated token-id list) so
+// the device-side mask plumbing can be proven before any grammar exists. Unset => nullptr => the
+// engine behaves exactly as before, which is every deployed path.
+//
+// Deliberately crude, and NOT the shape the real implementation takes: one lazily allocated
+// process-wide bitset, no per-sequence state, never freed. A grammar needs one mask per sequence
+// rebuilt after every token. This exists only to answer "does masking reach the sampler".
+constexpr std::int32_t kDebugMaskTokenCeiling = 262144; // >= this family's 248,320 vocabulary
+
+const std::uint32_t* debug_allow_mask() {
+    static const std::uint32_t* cached = []() -> const std::uint32_t* {
+        const char* spec = std::getenv("NINFER_DEBUG_ALLOW_TOKENS");
+        if (spec == nullptr || *spec == '\0') { return nullptr; }
+        const std::size_t words = (static_cast<std::size_t>(kDebugMaskTokenCeiling) + 31U) / 32U;
+        std::vector<std::uint32_t> host(words, 0U);
+        std::size_t allowed = 0;
+        for (const char* p = spec; *p != '\0';) {
+            char* end        = nullptr;
+            const long value = std::strtol(p, &end, 10);
+            if (end == p) { break; }
+            if (value >= 0 && value < kDebugMaskTokenCeiling) {
+                host[static_cast<std::size_t>(value) >> 5U] |=
+                    1U << (static_cast<unsigned>(value) & 31U);
+                ++allowed;
+            }
+            p = (*end == ',') ? end + 1 : end;
+        }
+        if (allowed == 0) { return nullptr; }
+        void* device = nullptr;
+        if (cudaMalloc(&device, words * sizeof(std::uint32_t)) != cudaSuccess) { return nullptr; }
+        if (cudaMemcpy(device, host.data(), words * sizeof(std::uint32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(device);
+            return nullptr;
+        }
+        std::fprintf(stderr, "[ninfer] DEBUG allow-mask installed: %zu legal tokens\n", allowed);
+        return static_cast<const std::uint32_t*>(device);
+    }();
+    return cached;
+}
+
 ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source) {
     ops::SamplingConfig out;
     out.temperature       = source.temperature;
@@ -36,6 +83,7 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     out.frequency_penalty = source.frequency_penalty;
     out.seed              = source.seed;
     out.token_counts      = nullptr;
+    out.allow_mask        = debug_allow_mask();
     return out;
 }
 

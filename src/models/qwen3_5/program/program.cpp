@@ -394,6 +394,18 @@ bool Program::shared_capture_matches(const CaptureOffer& offer,
 
 void Program::skip_capture(CaptureOffer&& offer) { impl_->skip_capture(std::move(offer)); }
 
+void Program::upload_allow_masks(runtime::LaneId lane, std::span<const std::uint32_t> masks) {
+    impl_->upload_allow_masks(lane.value, masks);
+}
+
+std::size_t Program::allow_mask_words() const noexcept { return impl_->allow_mask_words(); }
+
+std::size_t Program::allow_mask_positions() const noexcept { return impl_->allow_mask_positions(); }
+
+std::span<const TokenId> Program::pending_drafts(runtime::LaneId lane) const {
+    return impl_->pending_drafts(lane.value);
+}
+
 runtime::ContextTransactionReserveStatus
 Program::reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
                                 const SharedPrefixHandle* replacement,

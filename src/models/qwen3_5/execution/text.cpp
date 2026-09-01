@@ -765,6 +765,14 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
         project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+        // A constraint has to reach the argmax below, which takes no SamplingConfig and would
+        // otherwise pick a forbidden token and hand it to the accept kernel as the verified
+        // target. Masking the logits themselves puts it in front of every consumer at once.
+        if (sampling_config_ != nullptr) {
+            ops::apply_allow_mask(logits, sampling_config_,
+                                  dimension(parameters_.model.resources().public_token_count),
+                                  stream);
+        }
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }

@@ -42,6 +42,11 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    // One constrained-decoding allow-mask per lane: a bitset over the token domain that
+    // SamplingConfig::allow_mask points into. Only lanes running a constrained request
+    // carry a live mask; the rest keep a null pointer and never read this. Absent under
+    // causal scoring, which allocates no sampling state at all.
+    std::optional<TensorLayout> allow_mask;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };

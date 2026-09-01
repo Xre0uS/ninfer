@@ -153,6 +153,68 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
                                device.stream));
 }
 
+void ProgramImpl::upload_allow_masks(std::uint32_t lane, std::span<const std::uint32_t> masks) {
+    if (lane >= max_concurrency) { throw std::invalid_argument("allow-mask lane is out of range"); }
+    RequestControl& request = requests[lane];
+    if (masks.empty()) {
+        // Clearing is a config write, not a mask write: the sampler tests the pointer, so leaving
+        // stale bits in the buffer is harmless once it is null again.
+        if (request.sampling_host.allow_mask != nullptr) {
+            request.sampling_host.allow_mask        = nullptr;
+            request.sampling_host.allow_mask_stride = 0;
+            Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+            CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                                       sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
+        return;
+    }
+    const auto words     = static_cast<std::size_t>(allow_mask.ne[0]);
+    const auto positions = static_cast<std::size_t>(allow_mask.ne[1]);
+    if (words == 0 || masks.size() % words != 0) {
+        throw std::invalid_argument("allow-mask does not cover the token domain exactly");
+    }
+    const std::size_t supplied = masks.size() / words;
+    if (supplied == 0 || supplied > positions) {
+        throw std::invalid_argument("allow-mask count exceeds the speculative position window");
+    }
+    Tensor mask_lane  = allow_mask.slice(2, static_cast<std::int32_t>(lane), 1);
+    auto* device_mask = static_cast<std::uint32_t*>(mask_lane.data);
+    CUDA_CHECK(cudaMemcpyAsync(device_mask, masks.data(), masks.size_bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+    // Positions past the supplied ones are unreachable -- column c is only consumed when every
+    // earlier draft was accepted, and the caller stops supplying at the first draft its constraint
+    // rejects, which cannot be accepted. Repeat the last mask there anyway so the buffer never
+    // holds stale bits from an earlier request, which would be a silent wrong answer rather than
+    // a loud one if that reasoning ever stopped holding.
+    for (std::size_t position = supplied; position < positions; ++position) {
+        CUDA_CHECK(cudaMemcpyAsync(device_mask + position * words,
+                                   masks.data() + (supplied - 1) * words,
+                                   words * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
+    // The pointer only has to be published once. After that every round is a contents-only
+    // upload into the same buffer, which is what keeps captured graphs replayable.
+    if (request.sampling_host.allow_mask != device_mask ||
+        request.sampling_host.allow_mask_stride != static_cast<std::int32_t>(words)) {
+        request.sampling_host.allow_mask        = device_mask;
+        request.sampling_host.allow_mask_stride = static_cast<std::int32_t>(words);
+        Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+        CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                                   sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
+}
+
+std::span<const TokenId> ProgramImpl::pending_drafts(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { return {}; }
+    if (speculative_backend != SpeculativeBackend::Mtp) { return {}; }
+    const SequenceState& sequence = active_sequence(lane);
+    const std::size_t count =
+        std::min<std::size_t>(sequence.mtp_draft_count, sequence.mtp_drafts.size());
+    return std::span<const TokenId>(sequence.mtp_drafts.data(), count);
+}
+
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 ||
         source.ne[0] != dimension(parameters.model.config().text.hidden_size) ||

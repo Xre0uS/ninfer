@@ -622,10 +622,39 @@ public:
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+
+        // Vocabulary view for token-level constraints, built once. Views point into the
+        // tokenizer's own decoded storage, so this costs one pointer-and-length per token rather
+        // than a second copy of the vocabulary.
+        //
+        // decode_token_bytes(id, /*skip_special_tokens=*/true) returns an empty view for special
+        // tokens, which is exactly the "cannot appear in constrained output" signal the mask
+        // builder skips on. Invalid ids -- padding in the token domain above the real vocabulary --
+        // are left empty for the same reason.
+        constraint_token_bytes.resize(tokenizer->vocab_size());
+        for (std::size_t id = 0; id < constraint_token_bytes.size(); ++id) {
+            const int token = static_cast<int>(id);
+            if (!tokenizer->is_valid_token(token)) { continue; }
+            constraint_token_bytes[id] = tokenizer->decode_token_bytes(token, true);
+        }
+        constraint_terminal_tokens = tokenizer->default_stop_token_ids();
+        // Any token whose RAW text carries the close marker ends the thinking block -- read
+        // without skip_special_tokens, because the marker is itself a special token.
+        for (std::size_t id = 0; id < constraint_token_bytes.size(); ++id) {
+            const int token = static_cast<int>(id);
+            if (!tokenizer->is_valid_token(token)) { continue; }
+            if (tokenizer->decode_token_bytes(token, false).find(kThinkClose) !=
+                std::string_view::npos) {
+                constraint_reasoning_close_tokens.push_back(token);
+            }
+        }
     }
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
+    std::vector<std::string_view> constraint_token_bytes;
+    std::vector<TokenId> constraint_terminal_tokens;
+    std::vector<TokenId> constraint_reasoning_close_tokens;
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
@@ -848,6 +877,13 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
         return checked_token_count(
             processor.count_tokens(std::move(messages), render_options(options), control));
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+}
+
+ConstraintVocabulary Frontend::constraint_vocabulary() const noexcept {
+    if (impl_ == nullptr) { return {}; }
+    return ConstraintVocabulary{.token_bytes            = impl_->constraint_token_bytes,
+                                .terminal_tokens        = impl_->constraint_terminal_tokens,
+                                .reasoning_close_tokens = impl_->constraint_reasoning_close_tokens};
 }
 
 MediaCacheSummary Frontend::media_cache_summary() const {

@@ -56,6 +56,27 @@ private:
     friend class PreparedPromptAccess;
 };
 
+// What a token-level constraint needs to know about the vocabulary, in terms that do not expose
+// the tokenizer. `token_bytes` is indexed by token id and holds each token's LITERAL bytes -- an
+// empty view means the token cannot appear in constrained output at all, which covers both special
+// tokens and ids that are padding in the token domain.
+//
+// The bytes matter: Qwen uses GPT-2 byte-level BPE, so a raw vocab key stores a space as U+0120 and
+// is not the token's bytes. A mask built from raw keys admits almost nothing and deadlocks
+// decoding. These are decoded.
+struct ConstraintVocabulary {
+    std::span<const std::string_view> token_bytes;
+    std::span<const TokenId> terminal_tokens;
+    // Tokens that end the thinking block. A response constraint starts at the token AFTER one of
+    // these, and under speculative decoding that boundary can fall INSIDE a draft block, so the
+    // caller must recognise it in a drafted token rather than waiting for the next round.
+    //
+    // By id, not by text: the closing marker is a SPECIAL token, and token_bytes above blanks
+    // specials because they can never appear in constrained output. Matching on text found nothing
+    // and let the first response token through unconstrained.
+    std::span<const TokenId> reasoning_close_tokens;
+};
+
 class Frontend {
 public:
     Frontend(const Frontend&);
@@ -71,6 +92,8 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    // Stable for the lifetime of this Frontend; the views point into tokenizer-owned storage.
+    [[nodiscard]] ConstraintVocabulary constraint_vocabulary() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,

@@ -260,6 +260,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.sampling_config = add_tensor(
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
+        // One mask PER SPECULATIVE POSITION per lane. A speculative round samples draft_window+1
+        // columns from a single config, and each column sits at a different point in the
+        // constrained document, so a single shared mask is exact only for column 0 and stale
+        // behind it.
+        //
+        // The width is the instance's public token count, not a compile-time constant: v3 binds
+        // the token domain at load time. At this family's 248,320 tokens that is 7,760 words --
+        // ~31 KB per position, ~124 KB per lane at draft_window 3, ~1 MB across eight lanes.
+        // Negligible against the KV cache, and it keeps the mask pointer stable so CUDA graph
+        // replay stays valid: graphs capture the pointer, not the contents, so uploading into a
+        // fixed buffer needs no recapture.
+        const auto mask_words = static_cast<std::int32_t>(
+            (parameters.model.resources().public_token_count + 31U) / 32U);
+        out.allow_mask = add_tensor(builder, DType::I32,
+                                    {mask_words, static_cast<std::int32_t>(plan.draft_window + 1U),
+                                     static_cast<std::int32_t>(plan.max_concurrency)},
+                                    "constrained decoding allow mask");
     }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =

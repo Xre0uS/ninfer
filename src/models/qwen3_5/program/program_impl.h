@@ -464,6 +464,25 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
+
+    void upload_allow_masks(std::uint32_t lane, std::span<const std::uint32_t> masks);
+
+    // Words in ONE position's allow-mask. The engine builds masks host-side and they must cover
+    // the token domain exactly, so it needs this to size them.
+    [[nodiscard]] std::size_t allow_mask_words() const noexcept {
+        return static_cast<std::size_t>(allow_mask.ne[0]);
+    }
+
+    // How many speculative positions a lane's mask block covers: draft_window + 1.
+    [[nodiscard]] std::size_t allow_mask_positions() const noexcept {
+        return static_cast<std::size_t>(allow_mask.ne[1]);
+    }
+
+    // The tokens this lane will draft in its next round, known since the previous commit. Column
+    // c of that round is reached only when these were accepted through c-1, so the engine can
+    // derive each column's constraint state from them before the round runs.
+    [[nodiscard]] std::span<const TokenId> pending_drafts(std::uint32_t lane) const;
+
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -601,6 +620,7 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    Tensor allow_mask;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
@@ -1133,6 +1153,9 @@ private:
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
+    // Publishes a constrained-decoding mask for one lane. `mask` is a bitset over the token
+    // domain, one bit per token, set where the token is legal at the sequence's current position.
+    // Passing an empty span clears the constraint and returns the lane to free sampling.
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();

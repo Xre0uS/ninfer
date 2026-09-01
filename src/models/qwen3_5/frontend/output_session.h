@@ -76,6 +76,10 @@ public:
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    // True while committed output is still inside the thinking block. A token-level constraint on
+    // the response must not apply here: the thinking block is not the response, and constraining
+    // it forces the model to think in JSON and leaves the content channel empty.
+    [[nodiscard]] bool in_reasoning() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 
