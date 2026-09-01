@@ -131,16 +131,22 @@ void validate_standard_output_controls(const Json& body) {
         }
     }
 
+    // DIVERGENCE FROM UPSTREAM. Upstream rejects every response_format but {"type":"text"} on the
+    // grounds that NInfer "cannot guarantee" constrained output. This tree does guarantee it: a
+    // JSON prefix automaton drives a per-position token allow-mask that is applied to the logits
+    // before the argmax, so the constraint holds at temperature 0 and across speculative columns
+    // rather than being a prompt-level request. json_object and json_schema are therefore accepted
+    // and ENFORCED; anything the compiler cannot enforce is still a 400 by name, never accepted and
+    // silently ignored. See STRUCTURED-OUTPUT.md.
     if (body.contains("response_format") && !body.at("response_format").is_null()) {
         const Json& format = body.at("response_format");
         if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
             bad_request("response_format must contain a string type", "response_format");
         }
-        if (format.at("type").get<std::string>() != "text") {
-            bad_request(
-                "this response_format requires constrained output, which NInfer cannot guarantee; "
-                "only {\"type\":\"text\"} is available",
-                "response_format", "response_format_not_supported");
+        const std::string type = format.at("type").get<std::string>();
+        if (type != "text" && type != "json_object" && type != "json_schema") {
+            bad_request("response_format type must be text, json_object or json_schema",
+                        "response_format", "response_format_not_supported");
         }
     }
 
@@ -879,6 +885,40 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 
 } // namespace
 
+// Compile the schema HERE rather than in the engine, so a schema this build cannot enforce is a
+// 400 before the request is admitted. Accepting it and running unconstrained would return 200 for
+// output that does not conform -- a worse contract than an honest refusal.
+void parse_response_format(const Json& body, GenerationRequest& output) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) { return; }
+    const Json& fmt        = body.at("response_format");
+    const std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
+                                 ? fmt.at("type").get<std::string>()
+                                 : std::string();
+    if (type == "json_object") {
+        output.structured = StructuredFormat::JsonObject;
+    } else if (type == "json_schema") {
+        if (!fmt.contains("json_schema") || !fmt.at("json_schema").is_object()) {
+            bad_request("response_format json_schema requires a json_schema object",
+                        "response_format");
+        }
+        const Json& wrapper = fmt.at("json_schema");
+        if (!wrapper.contains("schema") || !wrapper.at("schema").is_object()) {
+            bad_request("response_format json_schema requires a schema object",
+                        "response_format.json_schema.schema");
+        }
+        try {
+            output.schema = ninfer::constraint::compile_json_schema(wrapper.at("schema").dump());
+        } catch (const std::invalid_argument& error) {
+            ApiError api;
+            api.message = error.what();
+            api.param   = "response_format.json_schema.schema";
+            api.code    = "response_format_schema_not_supported";
+            throw ApiException(std::move(api));
+        }
+        output.structured = StructuredFormat::JsonSchema;
+    }
+}
+
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
@@ -900,6 +940,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, output.generation);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
+    parse_response_format(body, output.generation);
     parse_stream_options(body, output);
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);

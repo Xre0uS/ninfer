@@ -2,6 +2,8 @@
 
 #include "product/media_acquire/source.h"
 
+#include "runtime/constraint/json_schema.h"
+
 #include <ninfer/types.h>
 
 // Internal, wire-format-independent representation of a generation request.
@@ -13,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -115,6 +118,7 @@ struct ChatTurn {
 
 // Sampling overrides that have an executable Engine meaning. Protocol-only
 // fields are normalized or rejected before this value is constructed.
+
 struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
@@ -123,6 +127,7 @@ struct SamplingParams {
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
+
 };
 
 // Protocol-level effort vocabulary. Each wire adapter accepts the values from
@@ -186,6 +191,13 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    // response_format. JsonObject is enforced by a token-level constraint in the engine, not by
+    // asking the model in the prompt -- an instruction returns 200 for output that does not
+    // conform, which is a worse contract than an honest refusal.
+    StructuredFormat structured = StructuredFormat::None;
+    // Compiled at parse time so an unenforceable schema is a 400 at the wire rather than
+    // a request that runs unconstrained.
+    std::shared_ptr<const constraint::CompiledSchema> schema;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
