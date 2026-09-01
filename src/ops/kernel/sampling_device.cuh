@@ -236,6 +236,22 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
+// True when an allow-mask is installed and token `v` is not in it.
+//
+// A mask is a CONSTRAINT, not a preference, so unlike the penalties it must apply on every path
+// including greedy. The greedy routes deliberately read raw logits to stay bit-identical to
+// argmax() -- correct for penalties, wrong for a grammar -- so they call this directly rather
+// than going through sampling_adjusted_logit.
+__device__ __forceinline__ bool sampling_token_masked(int v, const SamplingConfig& c,
+                                                      int position = 0) {
+    if (c.allow_mask == nullptr) { return false; }
+    // Each speculative column carries its own mask; stride 0 collapses to a single shared one.
+    const std::uint32_t* mask =
+        c.allow_mask + static_cast<std::int64_t>(position) * c.allow_mask_stride;
+    const unsigned word = mask[static_cast<unsigned>(v) >> 5];
+    return (word & (1u << (static_cast<unsigned>(v) & 31u))) == 0u;
+}
+
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
 // carry a round-local count overlay: tokens already committed earlier in the
 // current speculative round but not yet flushed to the global `token_counts`. For speculative
@@ -247,6 +263,10 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
+    // overlay_len is the speculative column, which is also the constraint position: column `col`
+    // is reached only when drafts[0..col-1] were accepted, so its state and its penalty overlay
+    // are the same prefix. Non-speculative callers pass 0 and get the single mask.
+    if (sampling_token_masked(v, c, overlay_len)) { return -CUDART_INF_F; }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;

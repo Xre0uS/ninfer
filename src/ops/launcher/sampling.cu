@@ -8,6 +8,8 @@
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
 
+#include <algorithm>
+
 namespace ninfer::ops::detail {
 
 __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std::int32_t count,
@@ -57,6 +59,18 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
     increment_token_counts_kernel<<<div_up(count, kBlock), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(token_ids.data), count,
         static_cast<std::int32_t*>(token_counts.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void apply_allow_mask_launch(Tensor& logits, const SamplingConfig* configs,
+                             std::int32_t token_domain, std::int32_t physical_rows,
+                             std::int32_t cols, std::int32_t batch, cudaStream_t stream) {
+    constexpr int kTilesPerColumn = 64; // enough resident CTAs without a huge grid
+    const dim3 grid(static_cast<unsigned int>(
+                        std::min(kTilesPerColumn, div_up(token_domain, kSamplerBlock))),
+                    static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
+    apply_allow_mask_kernel<<<grid, kSamplerBlock, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(logits.data), configs, token_domain, physical_rows, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 

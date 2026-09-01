@@ -19,6 +19,29 @@ std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::in
                                                   std::min(max_lanes, kSamplerMaxColumns));
 }
 
+void apply_allow_mask(Tensor& logits, const SamplingConfig* configs,
+                      std::int32_t token_domain, cudaStream_t stream) {
+    if (logits.dtype != DType::BF16) {
+        throw std::invalid_argument("apply_allow_mask: logits must be BF16");
+    }
+    if (logits.ne[3] != 1) {
+        throw std::invalid_argument("apply_allow_mask: logits must be rank-3 [rows,cols,B]");
+    }
+    if (logits.ne[0] <= 0 || logits.ne[1] <= 0 || logits.ne[2] <= 0) {
+        throw std::invalid_argument("apply_allow_mask: logits extents must be positive");
+    }
+    if (token_domain <= 0 || token_domain > logits.ne[0]) {
+        throw std::invalid_argument("apply_allow_mask: token_domain must be in [1, rows]");
+    }
+    if (configs == nullptr) {
+        throw std::invalid_argument("apply_allow_mask: configs must not be null");
+    }
+    detail::apply_allow_mask_launch(logits, configs, token_domain,
+                                    static_cast<std::int32_t>(logits.ne[0]),
+                                    static_cast<std::int32_t>(logits.ne[1]),
+                                    static_cast<std::int32_t>(logits.ne[2]), stream);
+}
+
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream) {

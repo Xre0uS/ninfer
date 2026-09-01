@@ -31,6 +31,20 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    // Optional device bitset over the token domain, ceil(token_domain/32) u32 words, bit v set
+    // => token v is legal this step. Null disables the constraint entirely and costs nothing.
+    //
+    // Consulted inside sampling_adjusted_logit, which runs per vocabulary entry during the full
+    // scan that BUILDS the candidate set -- so a masked token is rejected before it can occupy
+    // one of the kSamplerFastCandidates slots. That ordering is what makes the top-20 cap
+    // irrelevant to a grammar: the truncation happens downstream of the decision.
+    const std::uint32_t* allow_mask = nullptr;
+    // Words between consecutive per-position masks. Speculative verify samples several draft
+    // positions from one config, and each position has its own constraint state -- column c is
+    // only ever consumed when drafts[0..c-1] were all accepted, so that state is known on the
+    // host before the round runs. 0 means one mask for every position, which is what the
+    // non-speculative path wants.
+    std::int32_t allow_mask_stride = 0;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -73,6 +87,29 @@ struct SamplingConfig {
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
  * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
  */
+/**
+ * Op: apply_allow_mask
+ *
+ * Math / indexing:
+ *   For each row b and column c, logits[v,c,b] = -inf wherever configs[b].allow_mask says token v
+ *   is illegal at position c. Rows whose config carries no mask are untouched.
+ *
+ * Why it exists:
+ *   Speculative verify picks its target token with a plain argmax over these logits, and argmax
+ *   takes no SamplingConfig, so a constraint expressed only in the sampler never reaches the
+ *   greedy path. Writing -inf into the logits puts the constraint where every consumer sees it --
+ *   the argmax and the accept kernel's probabilities alike.
+ *
+ * Logical shapes:
+ *   logits is BF16 [physical_rows,cols,B], token_domain is in [1,physical_rows], cols>=1, B>=1,
+ *   and configs points to a device-resident SamplingConfig[B].
+ *
+ * Effects:
+ *   In-place on logits. Masked entries become -inf; every other entry is bit-preserved.
+ */
+void apply_allow_mask(Tensor& logits, const SamplingConfig* configs, std::int32_t token_domain,
+                      cudaStream_t stream);
+
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);

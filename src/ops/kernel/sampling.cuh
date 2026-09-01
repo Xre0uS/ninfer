@@ -24,26 +24,25 @@ __launch_bounds__(kSamplerBlock) __global__
     __shared__ float red_val[kSamplerBlock];
     __shared__ int red_idx[kSamplerBlock];
 
-    // With penalties disabled this remains the exact raw-logit argmax route.
+    // Greedy: exact argmax. Bit-identical to argmax() when no mask is installed and no penalties
+    // are set. A mask applies even here, because a constraint is not a preference and must hold at
+    // temperature 0 -- precisely the setting schema-constrained extraction uses. Penalties compose
+    // with the mask rather than replacing it: a masked token stays -inf whatever the penalty says.
     if (!(cfg.temperature > 0.0f)) {
         float bv             = -CUDART_INF_F;
         int bi               = INT_MAX;
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-        if (!penalties) {
-            for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = __bfloat162float(logits[base + v]);
-                if (sampling_better(x, v, bv, bi)) {
-                    bv = x;
-                    bi = v;
-                }
+        for (int v = tid; v < token_domain; v += blockDim.x) {
+            float x;
+            if (sampling_token_masked(v, cfg)) {
+                x = -CUDART_INF_F;
+            } else {
+                const float raw = __bfloat162float(logits[base + v]);
+                x               = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
             }
-        } else {
-            for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
-                if (sampling_better(x, v, bv, bi)) {
-                    bv = x;
-                    bi = v;
-                }
+            if (sampling_better(x, v, bv, bi)) {
+                bv = x;
+                bi = v;
             }
         }
         red_val[tid] = bv;
@@ -126,8 +125,13 @@ __launch_bounds__(kSamplerBlock) __global__
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = __bfloat162float(logits[base + v]);
-            const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
-            keys[item]      = sampling_sort_key(x, v);
+            // The mask is a constraint, not a preference: it applies on every arm, including
+            // temperature 0. Penalties then compose on top when set -- upstream made the greedy
+            // path penalty-aware, so there is no longer a greedy special case here.
+            const float x = sampling_token_masked(v, cfg)
+                                ? -CUDART_INF_F
+                                : (penalties ? sampling_adjusted_logit(raw, v, cfg) : raw);
+            keys[item]    = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
         }
@@ -291,6 +295,32 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
         out[col] = picked;
         if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         workspace.group_done[col] = 0;
+    }
+}
+
+
+// Writes -inf into every logit the allow-mask forbids, per row and per speculative column.
+//
+// The sampler can already refuse a masked token, but speculative verify chooses its target token
+// with a plain argmax that never sees a SamplingConfig. Putting the constraint into the logits
+// themselves reaches both, and is idempotent with the sampler's own test.
+__launch_bounds__(kSamplerBlock) __global__
+    void apply_allow_mask_kernel(__nv_bfloat16* logits, const SamplingConfig* configs,
+                                 std::int32_t token_domain, std::int32_t physical_rows,
+                                 std::int32_t cols) {
+    const int row            = static_cast<int>(blockIdx.z);
+    const int col            = static_cast<int>(blockIdx.y);
+    const SamplingConfig cfg = configs[row];
+    if (cfg.allow_mask == nullptr) { return; }
+    const std::int64_t base =
+        (static_cast<std::int64_t>(row) * cols + col) * static_cast<std::int64_t>(physical_rows);
+    const int stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    for (int v = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                 static_cast<int>(threadIdx.x);
+         v < token_domain; v += stride) {
+        if (sampling_token_masked(v, cfg, col)) {
+            logits[base + v] = __float2bfloat16(-CUDART_INF_F);
+        }
     }
 }
 
