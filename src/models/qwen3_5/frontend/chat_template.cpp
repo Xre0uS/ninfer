@@ -67,8 +67,19 @@ Json template_parameters(const ChatRenderOptions& options, const Json& special_t
         if (context.contains(name) && context[name].is_null()) context.erase(name);
     }
     if (options.enable_thinking) merge_option(context, "enable_thinking", *options.enable_thinking);
-    if (options.preserve_thinking)
+    if (options.preserve_thinking) {
         merge_option(context, "preserve_thinking", *options.preserve_thinking);
+    } else if (!context.contains("preserve_thinking")) {
+        // The maintained template takes its preserve branch when this is UNDEFINED, so leaving it
+        // unset retains every closed turn's reasoning -- the opposite of what --preserve-thinking
+        // documents, and 17x the prompt on a ten-turn agentic loop that echoes reasoning_content
+        // back. Bind the default explicitly so the flag is the opt-in it claims to be, and so this
+        // agrees with retain_open_turn below, which already defaults to false.
+        //
+        // Not merge_option: that throws on a conflicting value, and an explicit
+        // chat_template_kwargs.preserve_thinking is already in the context and must win.
+        context["preserve_thinking"] = false;
+    }
     if (options.reasoning_effort) {
         const auto name = reasoning_effort_name(*options.reasoning_effort);
         if (name.empty()) throw std::invalid_argument("invalid reasoning effort");
